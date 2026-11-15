@@ -1,45 +1,40 @@
-ARG AIRFLOW_VERSION=3.4.0
-ARG PYTHON_VERSION=3.12
-ARG UV_VERSION=0.6.6
-
-FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv_bin
-FROM apache/airflow:${AIRFLOW_VERSION}-python${PYTHON_VERSION}
-
-ARG AIRFLOW_VERSION
+# 1. Infer PYTHON_VERSION from .env (injected via Docker Compose build args)
 ARG PYTHON_VERSION
 
-COPY --from=uv_bin /uv /uvx /usr/local/bin/
+# ==============================================================================
+# Shared Base Image: Inferred Python + Astral uv + System Dependencies
+# ==============================================================================
+FROM python:${PYTHON_VERSION:-3.12}-slim AS base
 
+# Re-declare ARG after FROM to persist it inside the container environment
+ARG PYTHON_VERSION
+ENV PYTHON_VERSION=${PYTHON_VERSION:-3.12}
+
+# Install uv from official Astral image
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+# Environment settings for optimal Docker & uv performance
 ENV UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
-    UV_PYTHON_DOWNLOADS=never \
-    PYTHONPATH="/app:${PYTHONPATH}"
+    PYTHONUNBUFFERED=1 \
+    PATH="/app/.venv/bin:$PATH"
 
-# Switch to root for system packages (build-essential, unixodbc-dev)
-USER root
-RUN apt-get update \
- && apt-get install -y --no-install-recommends \
-        build-essential \
-        unixodbc-dev \
- && rm -rf /var/lib/apt/lists/* \
- && mkdir -p /app/dbt /app/data /app/ingest \
- && chown -R airflow:0 /app
-
-# Switch back to airflow user (UID 50000) for Python installs
-USER airflow
 WORKDIR /app
 
-# 1. Ingestion deps -> installed directly into Airflow's system Python
-COPY --chown=airflow:0 pyproject.toml uv.lock ./
-RUN --mount=type=cache,target=/home/airflow/.cache/uv,uid=50000 \
-    uv export --frozen --no-dev --no-hashes --format requirements-txt > /tmp/requirements.txt \
- && uv pip install --system -r /tmp/requirements.txt \
- && rm /tmp/requirements.txt
+# Install common system packages needed across tools (ODBC, C++ tools, git, curl)
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        git \
+        build-essential \
+        unixodbc-dev \
+        curl \
+ && rm -rf /var/lib/apt/lists/*
 
-# 2. Isolated dbt env -> /app/dbt/.venv
-COPY --chown=airflow:0 dbt/pyproject.toml dbt/
-RUN --mount=type=cache,target=/home/airflow/.cache/uv,uid=50000 \
-    UV_PROJECT_ENVIRONMENT=/app/dbt/.venv uv sync --frozen --no-dev --no-install-project --project dbt
+# Pre-cache project dependencies
+COPY pyproject.toml uv.lock ./
+COPY dbt/pyproject.toml dbt/
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv sync --frozen --no-dev --no-install-project
 
-# Return to Airflow's default working directory
-WORKDIR /opt/airflow
+# Default command to verify Python and uv
+CMD ["python", "-c", "import sys, os; print(f'Base image running Python {sys.version.split()[0]} (inferred from .env: {os.getenv(\"PYTHON_VERSION\")}) and uv')"]

@@ -1,0 +1,46 @@
+# Infer AIRFLOW_VERSION and PYTHON_VERSION from .env
+ARG AIRFLOW_VERSION
+ARG PYTHON_VERSION
+
+FROM apache/airflow:${AIRFLOW_VERSION:-3.4.0}-python${PYTHON_VERSION:-3.12}
+
+ARG PYTHON_VERSION
+ENV PYTHON_VERSION=${PYTHON_VERSION:-3.12}
+
+# Install uv from official Astral image
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+
+# Environment settings for uv and Python
+ENV UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    UV_PYTHON_DOWNLOADS=never \
+    PYTHONPATH="/app:${PYTHONPATH}"
+
+# Switch to root for system packages (build-essential, unixodbc-dev)
+USER root
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        build-essential \
+        unixodbc-dev \
+ && rm -rf /var/lib/apt/lists/* \
+ && mkdir -p /app/dbt /app/data /app/ingest \
+ && chown -R airflow:0 /app
+
+# Switch back to airflow user (UID 50000) for Python installs
+USER airflow
+WORKDIR /app
+
+# 1. Ingestion deps -> installed directly into Airflow's system Python
+COPY --chown=airflow:0 pyproject.toml uv.lock ./
+COPY --chown=airflow:0 dbt/pyproject.toml dbt/
+RUN --mount=type=cache,target=/home/airflow/.cache/uv,uid=50000 \
+    uv export --frozen --no-dev --no-hashes --format requirements-txt > /tmp/requirements.txt \
+ && uv pip install --system -r /tmp/requirements.txt \
+ && rm /tmp/requirements.txt
+
+# 2. Isolated dbt env -> /app/dbt/.venv (for Cosmos local execution)
+RUN --mount=type=cache,target=/home/airflow/.cache/uv,uid=50000 \
+    UV_PROJECT_ENVIRONMENT=/app/dbt/.venv uv sync --frozen --no-dev --no-install-project --project dbt
+
+# Return to Airflow's default working directory
+WORKDIR /opt/airflow

@@ -1,112 +1,218 @@
-services:
-  postgres:
-    image: postgres:16-alpine
-    container_name: postgres
-    environment:
-      POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER must be set in .env}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
-      POSTGRES_DB: ${POSTGRES_DB:?POSTGRES_DB must be set in .env}
-    volumes:
-      - postgres-db-volume:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER}"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    restart: always
+x-airflow-common: &airflow-common
+  build:
+    context: .
+    dockerfile: Dockerfile.airflow
+    args:
+      AIRFLOW_VERSION: ${AIRFLOW_VERSION}
+      PYTHON_VERSION: ${PYTHON_VERSION}
+  env_file:
+    - path: .env
+      required: true
+    - path: airflow/.env
+      required: true
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${_AIRFLOW_WWW_USER_USERNAME}:${_AIRFLOW_WWW_USER_PASSWORD}@postgres/airflow
 
-  airflow-common: &airflow-common
+  volumes:
+    # Mount the entire repository root for development
+    - ${AIRFLOW_PROJ_DIR}:/opt/airflow/logistics_analytics_project
+    - ${AIRFLOW_PROJ_DIR}/airflow/dags:/opt/airflow/dags
+    - ${AIRFLOW_PROJ_DIR}/airflow/logs:/opt/airflow/logs
+    - ${AIRFLOW_PROJ_DIR}/airflow/plugins:/opt/airflow/plugins
+    - ${AIRFLOW_PROJ_DIR}/airflow/config:/opt/airflow/config
+    - ${AIRFLOW_PROJ_DIR}/dbt:/opt/airflow/dbt # dbt folder (Airflow runs dbt)
+    - ${AIRFLOW_PROJ_DIR}/scripts:/opt/airflow/scripts
+
+  user: "${AIRFLOW_UID}:0"
+  networks:
+    - audit_network
+  depends_on: &airflow-common-depends-on
+    postgres:
+      condition: service_healthy
+    base:
+      condition: service_completed_successfully
+
+services:
+  base:
+    container_name: adt-base
+    image: adt-base:latest
     build:
       context: .
       dockerfile: Dockerfile
       args:
-        AIRFLOW_VERSION: ${AIRFLOW_VERSION:-3.4.0}
         PYTHON_VERSION: ${PYTHON_VERSION:-3.12}
-    image: ${AIRFLOW_IMAGE_NAME:-duckdb-adt-airflow:latest}
-    user: "${AIRFLOW_UID:-50000}:0"
-    env_file:
-      - .env
-    environment:
-      &airflow-common-env
-      AIRFLOW__CORE__EXECUTOR: LocalExecutor
-      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: ${AIRFLOW__DATABASE__SQL_ALCHEMY_CONN:-postgresql+psycopg2://${POSTGRES_USER:?POSTGRES_USER must be set in .env}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}@postgres:5432/${POSTGRES_DB:?POSTGRES_DB must be set in .env}}
-      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
-      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
-      AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session'
-      AIRFLOW_UID: ${AIRFLOW_UID:-50000}
-      PYTHONPATH: /app:/opt/airflow
-    volumes:
-      - ./airflow:/opt/airflow/dags
-      - ./config:/opt/airflow/config
-      - ./data:/app/data
-      - ./ingest:/app/ingest
-      - ./dbt:/app/dbt
-      # Anonymous volume preserves container-built dbt virtualenv from being overwritten by host mount
-      - /app/dbt/.venv
-      - logs:/opt/airflow/logs
-    depends_on:
-      postgres:
-        condition: service_healthy
-
-  airflow-init:
-    <<: *airflow-common
-    container_name: airflow-init
-    entrypoint: /bin/bash
-    command:
-      - -c
-      - |
-        mkdir -p /opt/airflow/logs /opt/airflow/dags /opt/airflow/config /app/data
-        airflow db migrate
-        airflow users create \
-          --username "${_AIRFLOW_WWW_USER_USERNAME:-airflow}" \
-          --password "${_AIRFLOW_WWW_USER_PASSWORD:-airflow}" \
-          --firstname Admin \
-          --lastname User \
-          --role Admin \
-          --email admin@example.com || true
     restart: "no"
+    networks:
+      - audit_network
 
-  airflow-webserver:
-    <<: *airflow-common
-    container_name: airflow-webserver
-    command: webserver
+  postgres:
+    image: postgres:16
+    env_file:
+      - path: airflow/.env # default
+        required: true
+    environment:
+      POSTGRES_USER: ${_AIRFLOW_WWW_USER_USERNAME}
+      POSTGRES_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD}
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${DATABASE_PORT:-5432}:5432"
+    networks:
+      - audit_network
+
+  airflow-apiserver:
+    <<: *airflow-common # ← "Copy all config from airflow-common here"
+    command: api-server # ← Plus override/add this
     ports:
       - "8080:8080"
     healthcheck:
-      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/version"]
       interval: 30s
       timeout: 10s
-      retries: 5
+      retries: 3
       start_period: 30s
     restart: always
     depends_on:
+      <<: *airflow-common-depends-on
       airflow-init:
         condition: service_completed_successfully
 
   airflow-scheduler:
-    <<: *airflow-common
-    container_name: airflow-scheduler
-    command: scheduler
+    <<: *airflow-common # ← "Copy all config from airflow-common here"
+    command: scheduler # ← Plus override/add this
     healthcheck:
-      test: ["CMD-SHELL", 'airflow jobs check --job-type SchedulerJob --hostname "$${HOSTNAME}"']
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
       interval: 30s
       timeout: 10s
-      retries: 5
+      retries: 3
+      start_period: 30s
+    restart: always
+    volumes:
+      # Re-declare all common volumes here as compose doesn't auto-merge
+      - ${AIRFLOW_PROJ_DIR}:/opt/airflow/logistics_analytics_project
+      - ${AIRFLOW_PROJ_DIR}/airflow/dags:/opt/airflow/dags
+      - ${AIRFLOW_PROJ_DIR}/airflow/logs:/opt/airflow/logs
+      - ${AIRFLOW_PROJ_DIR}/airflow/plugins:/opt/airflow/plugins
+      - ${AIRFLOW_PROJ_DIR}/airflow/config:/opt/airflow/config
+      - ${AIRFLOW_PROJ_DIR}/dbt:/opt/airflow/dbt
+      - ${AIRFLOW_PROJ_DIR}/scripts:/opt/airflow/scripts
+      # Docker socket for dbt container exec
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+    working_dir: /opt/airflow/logistics_analytics_project
+
+  airflow-dag-processor:
+    <<: *airflow-common # ← "Copy all config from airflow-common here"
+    command: dag-processor # ← Plus override/add this
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          'airflow jobs check --job-type DagProcessorJob --hostname "$${HOSTNAME}"',
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
       start_period: 30s
     restart: always
     depends_on:
+      <<: *airflow-common-depends-on
       airflow-init:
         condition: service_completed_successfully
 
-  airflow-triggerer:
+  airflow-init:
     <<: *airflow-common
-    container_name: airflow-triggerer
-    command: triggerer
-    restart: always
+    entrypoint: /bin/bash
+    command: /opt/airflow/scripts/airflow-init.sh
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME}
+      _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD}
+    networks:
+      - audit_network
+    user: "0:0"
+
+  duckdb:
+    image: duckdb/duckdb
+    volumes:
+      - ./db:/workspace
+    working_dir: /workspace
+    stdin_open: true
+    tty: true
+    network_mode: host # for duckdb web ui
+
+  dbt:
+    container_name: dbt
+    build:
+      context: .
+      dockerfile: Dockerfile.dbt
+      target: dbt-third-party # name of the build stage from the Dockerfile you want to build and run.
+      args:
+        dbt_third_party: "dbt-duckdb" # or whichever plugin you need
+    image: my-dbt:latest
+    volumes:
+      - ./db:/workspace/db
+      - ./dbt:/usr/app/dbt
+      - ./.dbt:/root/.dbt
+    working_dir: /usr/app/dbt/
+    stdin_open: true
+    tty: true
+    command: sleep infinity
+    network_mode: host # dbt docs UI is served via host network
     depends_on:
-      airflow-init:
+      base:
         condition: service_completed_successfully
+      duckdb:
+        condition: service_started
+
+  # superset-db-init:
+  #   image: postgres:16
+  #   env_file:
+  #     - path: airflow/.env
+  #       required: true
+  #   environment:
+  #     POSTGRES_USER: ${_AIRFLOW_WWW_USER_USERNAME}
+  #     POSTGRES_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD}
+  #   volumes:
+  #     - ./superset/superset-db-init.sh:/tmp/superset-db-init.sh:ro
+  #   command: ["/bin/bash", "/tmp/superset-db-init.sh"]
+  #   depends_on:
+  #     postgres:
+  #       condition: service_healthy
+  #   networks:
+  #     - audit_network
+  #   restart: "no"
+  redis:
+    image: redis:7
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis:/data
+    networks:
+      - audit_network
+
+networks:
+  audit_network:
+    name: audit_network
+    driver: bridge
 
 volumes:
   postgres-db-volume:
-  logs:
+  redis:
+    external: false
