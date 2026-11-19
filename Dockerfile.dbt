@@ -7,12 +7,20 @@ FROM ${BASE_IMAGE} AS dbt-core
 
 ARG DBT_CORE_VERSION=">=1.8,<2.0"
 
-WORKDIR /usr/app/dbt
-ENV DBT_PROFILES_DIR=/root/.dbt
+ENV VIRTUAL_ENV=/app/.venv \
+    PATH="/app/.venv/bin:$PATH" \
+    DBT_PROFILES_DIR=/app/dbt \
+    DBT_PROJECT_DIR=/app/dbt
+
+WORKDIR /app
 
 # Install dbt-core using uv (uv and system compilation tools already present from base)
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --system "dbt-core${DBT_CORE_VERSION}"
+    if [ -d "$VIRTUAL_ENV" ]; then \
+        uv pip install "dbt-core${DBT_CORE_VERSION}"; \
+    else \
+        uv pip install --system "dbt-core${DBT_CORE_VERSION}"; \
+    fi
 
 # ==============================================================================
 # Stage 2: Dynamic adapter installation (matches target: dbt-third-party in Compose)
@@ -23,7 +31,11 @@ ARG dbt_third_party="dbt-duckdb"
 
 RUN --mount=type=cache,target=/root/.cache/uv \
     if [ -n "$dbt_third_party" ]; then \
-        uv pip install --system "$dbt_third_party"; \
+        if [ -d "$VIRTUAL_ENV" ]; then \
+            uv pip install "$dbt_third_party"; \
+        else \
+            uv pip install --system "$dbt_third_party"; \
+        fi \
     fi
 
 ENTRYPOINT ["dbt"]

@@ -17,6 +17,7 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 ENV UV_COMPILE_BYTECODE=1 \
     UV_LINK_MODE=copy \
     PYTHONUNBUFFERED=1 \
+    VIRTUAL_ENV=/app/.venv \
     PATH="/app/.venv/bin:$PATH"
 
 WORKDIR /app
@@ -28,10 +29,11 @@ RUN apt-get update \
         build-essential \
         unixodbc-dev \
         curl \
- && rm -rf /var/lib/apt/lists/*
+ && rm -rf /var/lib/apt/lists/* \
+ && mkdir -p /app/data /app/dbt /app/ingest
 
 # Pre-cache project dependencies
-COPY pyproject.toml uv.lock ./
+COPY pyproject.toml uv.lock README.md* ./
 COPY dbt/pyproject.toml dbt/
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev --no-install-project

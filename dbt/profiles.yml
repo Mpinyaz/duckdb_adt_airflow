@@ -1,0 +1,11 @@
+audit:
+  target: prod
+  outputs:
+    prod:
+      type: duckdb
+      path: /app/data/warehouse/audit.duckdb
+      threads: 4
+    replay:
+      type: duckdb
+      path: /app/data/warehouse/replay.duckdb
+      threads: 4
